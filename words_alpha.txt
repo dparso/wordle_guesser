@@ -21217,6 +21217,7 @@ gamed
 gamekeeper
 gamekeepers
 gamely
+gamer
 gamers
 games
 gamesmanship
@@ -57621,6 +57622,7 @@ woolly
 wools
 wooly
 woos
+woozy
 word
 wordage
 worded

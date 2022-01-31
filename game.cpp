@@ -9,12 +9,22 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <unistd.h>
+#include <chrono>
 
 using namespace std;
+using namespace std::chrono;
+
+enum Strategy {
+    // each subsequent guess will use all clues
+    DEPENDENT = 0,
+    // allow independent guesses
+    INDEPENDENT = 1
+};
 
 enum GameType {
     PLAYER_GUESS = 0,
-    COMPUTER_GUESS = 1
+    COMPUTER_GUESS = 1,
+    TEST = 2
 };
 
 enum ComputerType {
@@ -32,48 +42,43 @@ using Hint = vector<MatchType>;
 
 const int MAX_GUESSES = 6;
 const string PROMPT = "> ";
+// number of times computer will make independent guesses before narrowing down
+const int NUM_SEPARATE_GUESSES = 2;
+
 bool GAME_WON = false;
 int WORD_LENGTH = 0;
 GameType GAME_TYPE = PLAYER_GUESS;
 ComputerType COMPUTER_TYPE = TRUST;
 
-unordered_set<string>         wordMap;
-vector<string>                wordList;
-unordered_map<char, double>   letterScoreMap;
-unordered_map<string, double> wordScoreMap;
+unordered_set<string>                            wordMap;
+vector<string>                                   wordList;
+unordered_map<char, double>                      letterFrequencyMap; // frequency of a letter appearing in a word
+unordered_map<char, unordered_map<int, double> > letterPositionMap; // frequency of a letter appearing in the i_th position of a word
+unordered_map<string, double>                    wordScoreMap;
 
 double calculateWordScore(const string& word)
 {
     // sum values of each unique letter in the word
+    // TODO: word score should also include frequency of letters in a given position
 
     unordered_set<char> foundLetters;
     foundLetters.reserve(word.size());
 
     double score = 0;
 
-    for (char c : word) {
-        if (foundLetters.count(c) > 0) continue;
+    for (size_t i = 0; i < word.size(); ++i) {
+        char c = word[i];
 
-        score += letterScoreMap[c];
+        if (foundLetters.count(c) > 0) continue;
+        
+        double letterScore = pow(letterFrequencyMap[c],2) * letterPositionMap[c][i];
+        score += letterScore;
+
 
         foundLetters.insert(c);
     }
 
     return score;
-}
-
-double getAdjustedWordScore(const unordered_set<char>& lettersInLastGuess, const string& word)
-{
-    // remove letters from word that have already been found
-    string adjustedWord;
-
-    for (char c : word) {
-        if (0 == lettersInLastGuess.count(c)) {
-            adjustedWord += c;
-        }
-    }
-
-    return calculateWordScore(adjustedWord);
 }
 
 string getOptimalWord(const unordered_set<string>& activeWords, const string& lastGuess)
@@ -86,20 +91,14 @@ string getOptimalWord(const unordered_set<string>& activeWords, const string& la
         exit(0);
     }
 
-    unordered_set<char> lettersInLastGuess;
-    for (char c : lastGuess) {
-        lettersInLastGuess.insert(c);
-    }
-
-    // choose a random word to start
+    // first word doesn't matter, best will be chosen
     auto it = activeWords.begin();
-    advance(it, rand() % activeWords.size());
 
     string optimalWord = *it;
-    double optimalScore = getAdjustedWordScore(lettersInLastGuess, optimalWord);
+    double optimalScore = wordScoreMap[optimalWord];
 
     for (const auto& w : activeWords) {
-        double score = getAdjustedWordScore(lettersInLastGuess, w);
+        double score = wordScoreMap[w];
         if (score > optimalScore) {
             optimalWord = w;
             optimalScore = score;
@@ -124,15 +123,48 @@ void readWords(const string& file)
         if (word.size() == WORD_LENGTH) {
             wordMap.insert(word);
             wordList.push_back(word);
-            wordScoreMap[word] = calculateWordScore(word);
         }
+    }
+}
+
+void processWords()
+{
+    // these will be specific to the word length specified
+    size_t numLetters = 0;
+
+    for (const auto& w : wordMap) {
+        numLetters += w.size();
+
+        for (size_t i = 0; i < w.size(); ++i) {
+            char c = w[i];
+            // update frequencies and position map
+            ++letterFrequencyMap[c];
+            ++letterPositionMap[c][i];
+        }
+    }
+
+    // normalize values
+    for (auto& l : letterPositionMap) {
+        for (auto& p : l.second) {
+            // normalize position by total occurrences of that letter
+            p.second = p.second / (double)letterFrequencyMap[l.first] * 100.0;
+        }
+    }
+
+    for (auto& it : letterFrequencyMap) {
+        // normalize frequency by total letter occurrences
+        it.second = it.second / (double)numLetters * 100.0;
+    }
+
+    for (const auto& w : wordMap) {
+        wordScoreMap[w] = calculateWordScore(w);
     }
 }
 
 void readLetters(const string& file)
 {
     // TODO: this should ideally be calculated based on the provided dictionary
-    
+
     ifstream infile(file);
 
     string line;
@@ -145,7 +177,7 @@ void readLetters(const string& file)
 
         iss >> letter >> freq;
 
-        letterScoreMap[tolower(letter)] = freq;
+        letterFrequencyMap[tolower(letter)] = freq;
     }
 }
 
@@ -217,17 +249,18 @@ void filterWordsByHint(unordered_set<string>& words, const string& lastGuess, co
     unordered_map<char, int> slideLetters;
     vector<pair<char, int> > hitLetters;
     for (size_t i = 0; i < hint.size(); ++i) {
+        char c = lastGuess[i];
         auto h = hint[i];
         
         switch (h) {
             case MISS:
-                missLetters.insert(lastGuess[i]);
+                missLetters.insert(c);
                 break;
             case SLIDE:
-                slideLetters[lastGuess[i]] = i;
+                slideLetters[c] = i;
                 break;
             case HIT:
-                hitLetters.emplace_back(lastGuess[i], i);
+                hitLetters.emplace_back(c, i);
                 break;
         }
     }
@@ -414,29 +447,18 @@ void checkWin(const Hint& hint)
     }
 }
 
-void playGame()
+int playerGuess()
 {
-    // (COMPUTER_GUESS) will filter words based on hints
-    auto activeWords = wordMap;
-
     string word, guess;
     Hint hint;
+    
+    cout << "Okay, choosing a word...";
+    size_t index = rand() % wordList.size();
+    word = wordList[index];
 
-    if (GAME_TYPE == PLAYER_GUESS) {
-        cout << "Okay, choosing a word...";
-        
-        size_t index = rand() % wordList.size();
-        word = wordList[index];
-
-        cout << " I chose a " << word.size() << "-letter word.\n";
-        cout << "word=" << word << endl;
-        cout << "Begin guessing -- you have six tries!\n";
-
-    } else if (GAME_TYPE == COMPUTER_GUESS) {
-        if (COMPUTER_TYPE == TRUST) {
-            word = getPlayerWord();
-        }
-    }
+    cout << " I chose a " << word.size() << "-letter word.\n";
+    cout << "word=" << word << endl;
+    cout << "Begin guessing -- you have six tries!\n";
 
     // collect letters from word
     unordered_set<char> lettersInWord;
@@ -449,19 +471,73 @@ void playGame()
     {
         cout << "(" << guessNum << ") " << PROMPT;
 
-        // get guess, either player or computer
-        switch (GAME_TYPE) {
-            case PLAYER_GUESS:
-                guess = getGuess(guessNum);
-                break;
-            case COMPUTER_GUESS:
-                guess = makeGuessFromHint(activeWords, guess, hint);
-                cout << guess << "\n";
-                break;
+        guess = getGuess(guessNum);
+        hint = checkGuess(guess, word, lettersInWord);
+        showHint(hint);
+        checkWin(hint);
+    }
+
+    if (GAME_WON) {
+        cout << "Congratulations! You got it!" << endl;
+    } else {
+        cout << "Better luck next time! The word was " << word << endl;
+    }
+
+    return guessNum;
+}
+
+int testGuess(const string& word)
+{
+    // will filter words based on hints
+    auto activeWords = wordMap;
+
+    string guess;
+    Hint hint;
+
+    // collect letters from word
+    unordered_set<char> lettersInWord;
+    for (const auto& c : word) {
+        lettersInWord.insert(c);
+    }
+    int guessNum = 0;
+    while(guessNum++ < MAX_GUESSES && !GAME_WON)
+    {
+        guess = makeGuessFromHint(activeWords, guess, hint);
+        hint = checkGuess(guess, word, lettersInWord);
+        checkWin(hint);
+    }
+
+    return guessNum;
+}
+
+int computerGuess()
+{
+    // will filter words based on hints
+    auto activeWords = wordMap;
+
+    string word, guess;
+    Hint hint;
+    unordered_set<char> lettersInWord;
+
+    if (COMPUTER_TYPE == TRUST) {
+        word = getPlayerWord();
+
+        // collect letters from word
+        for (const auto& c : word) {
+            lettersInWord.insert(c);
         }
+    }
+
+    int guessNum = 0;
+    while(guessNum++ < MAX_GUESSES && !GAME_WON)
+    {
+        cout << "(" << guessNum << ") " << PROMPT;
+
+        guess = makeGuessFromHint(activeWords, guess, hint);
+        cout << guess << "\n";
 
         // get hint, by input or calculation
-        if (GAME_TYPE == COMPUTER_GUESS && COMPUTER_TYPE == NO_TRUST) {
+        if (COMPUTER_TYPE == NO_TRUST) {
             // ask player for hint
             hint = getPlayerHint();
         } else {
@@ -471,22 +547,16 @@ void playGame()
 
         checkWin(hint);
 
-        if (GAME_TYPE == COMPUTER_GUESS) sleep(1);
+        sleep(1);
     }
 
     if (GAME_WON) {
-        if (GAME_TYPE == PLAYER_GUESS) {
-            cout << "Congratulations! You got it!" << endl;
-        } else if (GAME_TYPE == COMPUTER_GUESS) {
-            cout << "I guessed correctly!" << endl;
-        }
+        cout << "I guessed correctly!" << endl;
     } else {
-        if (GAME_TYPE == PLAYER_GUESS) {
-            cout << "Better luck next time! The word was " << word << endl;
-        } else if (GAME_TYPE == COMPUTER_GUESS) {
-            cout << "You outsmarted me... I'll get you next time! (or try that word again, I may do better!)" << endl;
-        }
+        cout << "You outsmarted me... I'll get you next time! (or try that word again, I may do better!)" << endl;
     }
+
+    return guessNum;
 }
 
 void showUsage(const string& name)
@@ -496,12 +566,49 @@ void showUsage(const string& name)
          << endl;
 }
 
+void doPlayTest()
+{
+    auto start = high_resolution_clock::now();
+
+    GAME_TYPE = TEST;
+
+    int numWins = 0;
+    vector<string> lostWords;
+
+    int numPlays = 0;
+    int numGuesses = 0;
+
+    for (const auto& word : wordMap) {
+        GAME_WON = false;
+
+        numGuesses += testGuess(word);
+
+        if (GAME_WON) {
+            ++numWins;
+        } else {
+            lostWords.push_back(word);
+        }
+
+        ++numPlays;
+
+        cout << "\r" << "Won " << numWins << ", lost " << lostWords.size() << flush;
+    }
+
+    auto stop = high_resolution_clock::now();
+    auto duration = duration_cast<milliseconds>(stop - start);
+    cout << "\nWord size=" << WORD_LENGTH << ", total time " << duration.count() << " ms, average time " << (duration.count() / (double)numPlays) << " ms"
+         << "\navg numGuesses=" << (numGuesses / (double)numPlays) 
+         << "\nLost words:\n";
+
+    for (const auto& w : lostWords) {
+        cout << w << " ";
+    }
+    cout << endl;
+}
+
 int main(int argc, char** argv)
 {
-    // cout << "Press enter to continue.";
-    // cin.ignore();
-
-    if (argc != 2) {
+    if (argc < 2) {
         showUsage(argv[0]);
         exit(0);
     }
@@ -521,8 +628,8 @@ int main(int argc, char** argv)
 
     cout << "Welcome to Wordle! Reading the dictionary for all " << WORD_LENGTH << " letter words..." << endl;
 
-    readLetters("letter_frequencies.txt");
     readWords("words_alpha.txt");
+    processWords();
 
     cout << "Found " << wordList.size() << " words." << endl;
 
@@ -538,45 +645,32 @@ int main(int argc, char** argv)
          << "\n\t- 2 the letter is in the correct position"
          << endl;
 
-    // sleep(1);
+    if (argc == 2) {
+        cout << "Would you like to guess (0), or provide a word for me to guess (1)? ";
+        int choice = 1;
+        cin >> choice;
+        GAME_TYPE = (choice) ? COMPUTER_GUESS : PLAYER_GUESS;
 
-    // string lastGuess = "trains";
-    // Hint hint = { HIT, MISS, MISS, SLIDE, SLIDE, HIT };
-    // filterWordsByHint(wordMap, lastGuess, hint);
+        if (GAME_TYPE == COMPUTER_GUESS) {
+            cout << "Do you trust me enough to tell me the word, so I can guess on my own? I only use the word to generate a hint. [y/n] ";
 
-    // for (auto& w : words) {
-    //     cout << w << " ";
-    // }
-    // cout << endl;
+            char computerChoice;
+            cin >> computerChoice;
+            computerChoice = tolower(computerChoice);
 
-    // exit(0);
+            COMPUTER_TYPE = (computerChoice == 'y') ? TRUST : NO_TRUST;
 
+            cin.ignore(); // clear newline from previous input
 
-    // sleep(1);
-
-    cout << "Would you like to guess (0), or provide a word for me to guess (1)? ";
-    int choice = 1;
-    cin >> choice;
-    GAME_TYPE = (choice) ? COMPUTER_GUESS : PLAYER_GUESS;
-
-    if (GAME_TYPE == COMPUTER_GUESS) {
-        cout << "Do you trust me enough to tell me the word, so I can guess on my own? I only use the word to generate a hint. [y/n] ";
-
-        char computerChoice;
-        cin >> computerChoice;
-        computerChoice = tolower(computerChoice);
-
-        COMPUTER_TYPE = (computerChoice == 'y') ? TRUST : NO_TRUST;
-
-        cin.ignore(); // clear newline from previous input
-
-        if (COMPUTER_TYPE == NO_TRUST) {
-            cout << "Okay, you'll have to provide the hints to me after I guess, following the rules above. Press enter to continue.\n";
-            cin.ignore();
+            if (COMPUTER_TYPE == NO_TRUST) {
+                cout << "Okay, you'll have to provide the hints to me after I guess, following the rules above. Press enter to continue.\n";
+                cin.ignore();
+            }
+            computerGuess();
+        } else if (GAME_TYPE == PLAYER_GUESS) {
+            playerGuess();
         }
+    } else {
+        doPlayTest();
     }
-
-    playGame();
-
-    cout << "Thanks for playing!" << endl;
 }
