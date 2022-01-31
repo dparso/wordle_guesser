@@ -43,12 +43,13 @@ using Hint = vector<MatchType>;
 const int MAX_GUESSES = 6;
 const string PROMPT = "> ";
 // number of times computer will make independent guesses before narrowing down
-const int NUM_SEPARATE_GUESSES = 2;
+const int NUM_INDEPENDENT_GUESSES = 2;
 
 bool GAME_WON = false;
 int WORD_LENGTH = 0;
-GameType GAME_TYPE = PLAYER_GUESS;
+GameType     GAME_TYPE     = PLAYER_GUESS;
 ComputerType COMPUTER_TYPE = TRUST;
+Strategy     STRATEGY      = DEPENDENT;
 
 unordered_set<string>                            wordMap;
 vector<string>                                   wordList;
@@ -81,7 +82,7 @@ double calculateWordScore(const string& word)
     return score;
 }
 
-string getOptimalWord(const unordered_set<string>& activeWords, const string& lastGuess)
+string getOptimalWord(const unordered_set<string>& activeWords)
 {
     // return word with highest letter score
     // adjust scores by removing letters that have already been found
@@ -226,7 +227,7 @@ bool checkSlideLetters(const unordered_map<char, bool>& foundMapTemplate, const 
     return true;
 }
 
-bool checkMissLetters(const unordered_set<char>& missLetters, const string& word)
+bool hasMissLetters(const unordered_set<char>& missLetters, const string& word)
 {
     // NOTE: at the moment, this method complicates dealing with duplicates
     // if word is 'game', and guess is 'gage', would like to return MISS for second G
@@ -275,22 +276,25 @@ void filterWordsByHint(unordered_set<string>& words, const string& lastGuess, co
         string w = *it;
 
         // word should contain all HIT letters in correct position
-        bool hasHitLetters = checkHitLetters(hitLetters, w);
-        if (!hasHitLetters) {
+        bool validHitLetters = checkHitLetters(hitLetters, w);
+
+        // erase if word does *not* have HIT letters
+        if (!validHitLetters) {
             it = words.erase(it);
             continue;
         }
 
         // word should contain all SLIDE letters, in any position BUT their previous position
-        bool hasSlideLetters = checkSlideLetters(foundMapTemplate, slideLetters, w);
-        if (!hasSlideLetters) {
+        bool validSlideLetters = checkSlideLetters(foundMapTemplate, slideLetters, w);
+        if (!validSlideLetters) {
             it = words.erase(it);
             continue;
         }
 
         // word cannot contain any MISS letters
-        bool hasMissLetters = checkMissLetters(missLetters, w);
-        if (hasMissLetters) {
+        bool validMissLetters = hasMissLetters(missLetters, w);
+        // both strategies erase if word has MISS letters
+        if (validMissLetters) {
             it = words.erase(it);
             continue;
         }
@@ -305,7 +309,7 @@ string makeGuessFromHint(unordered_set<string>& words, const string& lastGuess, 
     // get a new list of possible words based on what contains those letters
     filterWordsByHint(words, lastGuess, hint);
 
-    return getOptimalWord(words, lastGuess);
+    return getOptimalWord(words);
 }
 
 void showHint(const Hint& hint)
@@ -510,8 +514,126 @@ int testGuess(const string& word)
     return guessNum;
 }
 
+unordered_set<string> intersectLists(vector<unordered_set<string> >& wordLists)
+{
+    cout << "intersectLists for " << wordLists.size() << " lists" << endl;
+    unordered_set<string> result;
+
+    for (size_t i = 0; i < wordLists.size(); ++i) {
+        auto& list = wordLists[i];
+        cout << "list " << i << " " << list.size() << endl;
+        
+        for (auto wordIt = list.begin(); wordIt != list.end(); ) {
+            const string& word = *wordIt;
+            // cout << "word=" << word << endl;
+            
+            // for each word, check each other list
+            bool found = true;
+            for (size_t j = 0; j < wordLists.size(); ++j) {
+                if (i == j) continue;
+
+                // cout << "searching list " << j << endl;
+
+                auto it = wordLists[j].find(word);
+                if (it == wordLists[j].end()) {
+                    // cout << "not found" << endl;
+                    found = false;
+                    break;
+                } else {
+                    // cout << "found" << endl;
+                    // avoid duplicating search; erase from each list
+                    wordLists[j].erase(it);
+                }
+            }
+
+            // word was found in each set
+            if (found) {
+                result.insert(word);
+            }
+
+            wordIt = list.erase(wordIt);
+            // cout << endl;
+        }
+        // cout << "\n" << endl;
+    }
+
+    cout << "results:" << endl;
+    for (auto& r : result) {
+        // cout << r << endl;
+    }
+    cout << result.size() << endl;
+    return result;
+}
+
+void doIndependentGuesses(unordered_set<string>& activeWords,
+                          const string& word,
+                          Hint& hint,
+                          const unordered_set<char> lettersInWord,
+                          int& guessNum)
+{
+    /*
+        It's not as simple as negating the filter checks for the independent check
+        for instance, you can't say !hasHitLetters, because it's not just that the word
+        doesn't match every hit letter... it needs to be that it has _no_ hit letters at all
+        and for slide, independent should still skip same-letter-same-spot
+        different methods...
+    */
+
+    /* this is mostly garbage
+    cout << "activeWords length=" << activeWords.size() << endl;
+
+    // filter by removing MISS letters, but also removing SLIDE and HIT letters
+    // after allowed number of independent guesses, intersect the resulting filtered words from each independent guess
+    // and proceed normally
+
+    string guess;
+
+    // make a real first guess to start
+    auto activeWordsCopy = activeWords;
+
+    guess = makeGuessFromHint(activeWordsCopy, guess, hint);
+    hint = checkGuess(guess, word, lettersInWord);
+    showHint(hint);
+    filterWordsByHint(activeWordsCopy, guess, hint);
+
+    cout << "using guess=" << guess << ", got to " << activeWordsCopy.size() << endl;
+
+    auto it = activeWordsCopy.begin();
+    for (int i = 0; i < 30; ++i) {
+        cout << *(it++) << " ";
+    }
+    cout << endl;
+    vector<unordered_set<string> > independentWordLists;
+
+    // do multiple different searches from activeWordsCopy
+    // NOTE: it's the hints that are useful, not necessarily the resulting words
+    // collect the hints, and apply them all to the original word list
+    auto wordsCopy = activeWords;
+    // guess = getOptimalWord(wordsCopy);
+    // hint = checkGuess(guess, word, lettersInWord);
+    // showHint(hint);
+    filterWordsByHint(wordsCopy, guess, hint, INDEPENDENT);
+
+    cout << "using guess=" << guess << ", got to " << wordsCopy.size() << endl;
+    it = wordsCopy.begin();
+    for (int i = 0; i < 30; ++i) {
+        cout << *(it++) << " ";
+    }
+    cout << endl;
+
+    independentWordLists.push_back(move(wordsCopy));
+
+    ++guessNum;
+
+    // get intersection of each independent list
+    activeWords = intersectLists(independentWordLists);
+    */
+}
+
 int computerGuess()
 {
+    int guessNum = 0;
+
     // will filter words based on hints
     auto activeWords = wordMap;
 
@@ -526,9 +648,12 @@ int computerGuess()
         for (const auto& c : word) {
             lettersInWord.insert(c);
         }
+
+        if (STRATEGY == INDEPENDENT) {
+            doIndependentGuesses(activeWords, word, hint, lettersInWord, guessNum);
+        }
     }
 
-    int guessNum = 0;
     while(guessNum++ < MAX_GUESSES && !GAME_WON)
     {
         cout << "(" << guessNum << ") " << PROMPT;
@@ -621,10 +746,12 @@ int main(int argc, char** argv)
         exit(0);
     }
 
+    srand(time(NULL));
+
     // "partie", guessed "tarrie" twice in a row
     // need to mark "miss" for a second letter of a hit if there's only one
 
-    srand(time(NULL));
+    STRATEGY = DEPENDENT;
 
     cout << "Welcome to Wordle! Reading the dictionary for all " << WORD_LENGTH << " letter words..." << endl;
 
